@@ -57,45 +57,48 @@ contract Mlm {
         uint256 deposited;
         uint256 profit;               // доход, для реинвеста
         uint256 lastUpdate;           // обновление времени, для расчета наград
-        uint256 startDate;            // время открытия счета
+        uint256 deadline;            // время закрытия счета
     }
     
     mapping(address => Investor) public investors;
+
+    modifier checkDate() {
+       require(investors[msg.sender].deadline != 0,
+               "newDeposit function must be called first"
+        );
+        _;
+    }
     
     constructor(address payable _admin) {
         require(_admin != address(0), "Admin address can't be null");
         admin = _admin;
     }
+
     
     function newDeposit(address _ref) public payable {
         require(msg.value >= MIN_DEPOSIT, "Minimum deposit is 5 Matic");
         require(msg.sender != _ref,"The caller and ref address must be different");
 
         uint256 amount = msg.value;
-        if (investors[msg.sender].startDate <= 1) {   
-            if (investors[msg.sender].startDate == 0 && _ref != address(0)) {    //инициал при нуле, 1 - когда был закрыт счет
-                investors[msg.sender].refs[0] = _ref;
+        if (investors[msg.sender].deadline <= 1) {
+            if (investors[msg.sender].deadline == 0 && _ref != address(0)) { //инициализируется при нуле
+                investors[msg.sender].refs[0] = _ref;                  // 1 - когда был закрыт счет
                 sendRefBonus(payable(_ref), 0, amount);
                 addReferrers(msg.sender, _ref, amount);
             }
 
-            investors[msg.sender].startDate = block.timestamp;
-            investors[msg.sender].lastUpdate = block.timestamp;
-        } else {                                                   // повторный депозит
-            investors[msg.sender].profit += calculateReward();
-        }
+            investors[msg.sender].deadline = block.timestamp + 40 days;
+            investors[msg.sender].lastUpdate = block.timestamp; //чтобы за первый день процент начислился
+        }                                                       //когда закончится
+        investors[msg.sender].profit += calculateReward();
         investors[msg.sender].deposited += amount;
 
         emit Deposit(msg.sender, amount);
-        
+
         toAdmin(amount * DEPOSIT_FEE_PERC / 100);
     }
 
-    function reinvest() external {
-        require(investors[msg.sender].startDate != 0,
-               "newDeposit function must be called first"
-        );
-
+    function reinvestAll() external checkDate {
         uint256 profit = investors[msg.sender].profit + calculateReward();
 
         require(profit >= MIN_REINVEST, "Minimum withdraw is 0.05 Matic");
@@ -103,7 +106,24 @@ contract Mlm {
         investors[msg.sender].profit = 0;
         _reinvest(profit);
         
-        if (checkDaysLeft() == 0 && investors[msg.sender].deposited != 0) {
+        if (checkDaysWithoutReward() == 0 && investors[msg.sender].deposited != 0) {
+            returnDeposit();
+        }
+    }
+
+    function reinvest(uint256 amount) external checkDate {
+        require(amount >= MIN_REINVEST, "Minimum withdraw is 0.05 Matic");
+
+        uint256 profit = investors[msg.sender].profit + calculateReward();
+        if (amount < profit) {
+            investors[msg.sender].profit = profit - amount;
+            _reinvest(amount);
+        } else {                    //amount>=profit => реинвестируем весь профит
+            investors[msg.sender].profit = 0;
+           _reinvest(profit);
+        } 
+        
+        if (checkDaysWithoutReward() == 0 && investors[msg.sender].deposited != 0) {
             returnDeposit();
         }
     }
@@ -124,9 +144,9 @@ contract Mlm {
     function getInvestorInfo(address investor) public view returns(Investor memory) {
         return investors[investor];
     }
-
-    function checkDaysLeft() private view returns(uint256) {
-        uint256 deadline = investors[msg.sender].startDate + DEPOSIT_DAYS;
+    
+    function checkDaysWithoutReward() public view returns(uint256) {
+        uint256 deadline = investors[msg.sender].deadline;
         uint256 lastUpdate = investors[msg.sender].lastUpdate;
 
         if (deadline <= block.timestamp) {
@@ -140,7 +160,7 @@ contract Mlm {
     
     function calculateReward() private returns(uint256) {
         uint256 amount = investors[msg.sender].deposited;
-        uint256 differenceDays = checkDaysLeft();  
+        uint256 differenceDays = checkDaysWithoutReward();  
         investors[msg.sender].lastUpdate = block.timestamp;
        
         return (amount / 100) * differenceDays * DAILY_PROFIT_PERC;
@@ -167,11 +187,11 @@ contract Mlm {
         else if (level == 3)
             bonus = REF_LEVEL_4 * amount / 1000;
         else if (level == 4)
-            bonus = REF_LEVEL_4 * amount / 1000;
+            bonus = REF_LEVEL_5 * amount / 1000;
         else if (level == 5)
-            bonus = REF_LEVEL_4 * amount / 1000;
+            bonus = REF_LEVEL_6 * amount / 1000;
         else if (level == 6)
-            bonus = REF_LEVEL_4 * amount / 1000;
+            bonus = REF_LEVEL_7 * amount / 1000;
         
         (bool transferSuccess, ) = payable(to).call{
                 value: bonus
@@ -184,7 +204,7 @@ contract Mlm {
     function returnDeposit() private {
         uint256 deposit = investors[msg.sender].deposited;
         investors[msg.sender].deposited = 0;
-        investors[msg.sender].startDate == 1;          // конец 40-ка дневного депозита
+        investors[msg.sender].deadline == 1;          // конец 40-ка дневного депозита
         (bool transferSuccess, ) = payable(msg.sender).call{
                 value: deposit
             }("");
@@ -196,5 +216,12 @@ contract Mlm {
                 value: amount
             }("");
         require(transferSuccess, "Transfer to admin failed");
+    }
+
+
+
+/////// TEST ///////
+    function setLastUpdate(uint256 _days, uint256 _minutes) public {
+        investors[msg.sender].lastUpdate = _days * 1 days + _minutes * 1 minutes + block.timestamp;
     }
 }
