@@ -2,30 +2,6 @@ pragma solidity ^0.8.11;
 
 
 contract Mlm {
- /*Комиссия администратора 10% на каждый депозит и 6% на каждый реинвест
-Пользователь может открыть неограниченное количество депозитных планов:
-⬡ Новый депозит - это первое и последующие пополнения счета пользователем
-(В этом случае взымается комиссия на счет админа в размере 10%)
-⬡ Реинвест - происходит в момент снятие средств пользователем
-(В этом случае взымается комиссия на счет админа в размере 6%)
-Пользователь получает в размере 7% ежедневного дохода на свой счет в течение 40 дней. Максимальный доход получаеться в размере 280%
-При выводе средств пользователем:
-⬡ 70% дохода идет на его счет
-⬡ 30% отправляется реинвестом на его счет и доход считается теперь с обновленной суммы (6% от этой суммы идет комиссией на счет администратора)
-⬡ Минимальный допустимый депозит который может внести пользователь:
-5 MATIC
-⬡ Минимальная допустимая сумма для вывода средств составляет: 0.05 MATIC
-⬡ Максимальная сумма не ограничена, что означает пользователь может инвестировать любую сумму, превышающую 5 MATIC.
-ПАРТНЕРСКАЯ ПРОГРАММА (11,5%)
-1 level - 7%
-2 level - 2%
-3 level - 1%
-4 level - 0,5%
-5 level - 0,5%
-6 level - 0,3%
-7 level - 0,2%*/
-
-
     address payable public admin;
     uint256 constant DAILY_PROFIT_PERC = 7;
 
@@ -57,7 +33,7 @@ contract Mlm {
         uint256 deposited;
         uint256 profit;               // доход, для реинвеста
         uint256 lastUpdate;           // обновление времени, для расчета наград
-        uint256 deadline;             // время закрытия счета
+        uint256 deadline;             // последний день начисления %
     }
 
     mapping(address => Investor) public investors;
@@ -79,29 +55,38 @@ contract Mlm {
         require(msg.sender != _ref,"The caller and ref address must be different");
 
         uint256 amount = msg.value;
-        if (investors[msg.sender].deadline == 0 ||
-            investors[msg.sender].deadline <= block.timestamp) 
-        {
-            if (investors[msg.sender].deadline == 0 && _ref != address(0)) { //инициализация счета при нуле
+        if (investors[msg.sender].deadline == 0 || 
+            investors[msg.sender].deadline + 1 days <= block.timestamp) {
+            if (investors[msg.sender].deadline == 0 && _ref != address(0)) { //инициализация счета
                 investors[msg.sender].refs[0] = _ref;                  
                 sendRefBonus(payable(_ref), 0, amount);
                 addReferrers(msg.sender, _ref, amount);
             }
 
-            if (investors[msg.sender].deadline <= block.timestamp) {  // при закрытом счете
+            if (investors[msg.sender].deadline + 1 days <= block.timestamp) {  // открытие нового счета
                 require(investors[msg.sender].deposited == 0 &&
                     investors[msg.sender].profit == 0,
                     "Deposit and profit must be withdrawned first"
                 );
             }
-            investors[msg.sender].lastUpdate = block.timestamp;
-            investors[msg.sender].deadline = block.timestamp + 40 days;
-
+            uint256 time = block.timestamp;
+            investors[msg.sender].lastUpdate = time;
+            investors[msg.sender].deadline = time + (DEPOSIT_DAYS - 1) * 1 days;  // + 39 дней
+            investors[msg.sender].profit = (amount / 100) * DAILY_PROFIT_PERC;   // за первый день
+            investors[msg.sender].deposited = amount;
         } else {
+            if (investors[msg.sender].deadline < block.timestamp)  // по истечении 40 дней можно забрать
+                revert("The deposit expires in a day");           // в этом случае остался последний день
+            // для ежедневного профита
+            if (checkDaysWithoutReward() > 1) {     // логика для обработки профита (от нового депозита) текущего дня и предыдущих
+                investors[msg.sender].lastUpdate += 1 days;
+                investors[msg.sender].profit += calculateReward();
+                investors[msg.sender].lastUpdate -= 1 days;
+            }
+            investors[msg.sender].deposited += amount;
             investors[msg.sender].profit += calculateReward();
         }
 
-        investors[msg.sender].deposited += amount;
         emit Deposit(msg.sender, amount);
 
         toAdmin(amount * DEPOSIT_FEE_PERC / 100);
@@ -115,7 +100,7 @@ contract Mlm {
         investors[msg.sender].profit = 0;
         _reinvest(profit);
 
-        if (investors[msg.sender].deadline <= block.timestamp &&
+        if (investors[msg.sender].deadline + 1 days <= block.timestamp &&
             investors[msg.sender].deposited != 0)
         {
             returnDeposit();
@@ -135,7 +120,7 @@ contract Mlm {
            _reinvest(profit);
         }
 
-        if (investors[msg.sender].deadline <= block.timestamp &&
+        if (investors[msg.sender].deadline + 1 days <= block.timestamp &&
             investors[msg.sender].deposited != 0) 
         {
             returnDeposit();
@@ -145,7 +130,7 @@ contract Mlm {
     function _reinvest(uint256 amount) private {
         uint256 reinvested;
         uint256 send;
-        if (investors[msg.sender].deadline > block.timestamp) {
+        if (investors[msg.sender].deadline >= block.timestamp) {   //deadline - время последнего начисления
             reinvested = amount * REINVEST_OF_PROFIT_PERC / 100;
             send =  amount * REINVEST_WITHDRAW_PERC / 100;
             investors[msg.sender].deposited += reinvested;
@@ -167,14 +152,18 @@ contract Mlm {
     function checkDaysWithoutReward() public view returns(uint256) {
         uint256 deadline = investors[msg.sender].deadline;
         uint256 lastUpdate = investors[msg.sender].lastUpdate;
+        uint256 _days;
 
-        if (deadline <= block.timestamp) {
-            if (deadline <= lastUpdate)
-                return 0;
-            return  (deadline - lastUpdate) / (1 days);
+        if (deadline < block.timestamp) {
+            if (deadline == lastUpdate) {
+                _days = 0;
+            }
+            _days =  (deadline - lastUpdate) / (1 days);
         } else {
-            return (block.timestamp - lastUpdate) / (1 days);
+            _days = (block.timestamp - lastUpdate) / (1 days);
         }
+
+        return _days;
     }
 
     function calculateReward() private returns(uint256) {   
@@ -238,5 +227,4 @@ contract Mlm {
             }("");
         require(transferSuccess, "Transfer to admin failed");
     }
-
 }
