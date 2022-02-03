@@ -4,16 +4,17 @@ from brownie import accounts
 
 
 def test_new_deposit_1(mlm):
-    info = mlm.getInvestorInfo(accounts[0])
+    info = mlm.getCertainDeposit(accounts[0], 0)   # getAllDeposits
     balanceAcc1 = accounts[9].balance()
 
     for i in range(len(info)):
         print(info[i])
 
-    assert info[0][0] == accounts[1]
-    assert info[1] == 7 * 10 ** 18
+    assert mlm.getRefs({'from': accounts[0]})[0] == accounts[1]
+    assert info[0] == 7 * 10 ** 18
+    assert info[1] == (7 * 10 ** 16) * 7
 
-    # проверка функции toAdmin(); 10*10**18 - начальный баланс
+    # проверка функции toSend, перечисление админу
     assert balanceAcc1 == 100 * 10 ** 18 + 7 * 10 ** 18 / 10
     balanceAcc1 = accounts[9].balance()
 
@@ -22,9 +23,12 @@ def test_new_deposit_1(mlm):
 
     mlm.newDeposit(accounts[1], {'from': accounts[0], 'value': "5 ether"})
 
-    assert info[0][0] == accounts[1]
-    assert info[1] == 7 * 10 ** 18
-    assert info[2] == 7 * 10**16 * 7
+    assert mlm.getRefs({'from': accounts[0]})[0] == accounts[1]
+    assert mlm.getRefs({'from': accounts[0]})[1] != accounts[1]
+
+    info = mlm.getCertainDeposit(accounts[0], 1)
+    assert info[0] == 5 * 10 ** 18
+    assert info[1] == (5 * 10 ** 16) * 7
 
     assert accounts[9].balance() == balanceAcc1 + 5 * 10 ** 18 / 10
 
@@ -42,71 +46,89 @@ def test_new_deposit_2(mlm):
     assert (len(countBonus)) == 1
 
     tx = mlm.newDeposit(accounts[2], {'from': accounts[1], 'value': "6 ether"})
-    info = mlm.getInvestorInfo(accounts[1])
+    info = mlm.getCertainDeposit(accounts[1], 1)
 
-    assert info[1] == 11 * 10 ** 18
+    assert info[0] == 6 * 10 ** 18
     assert tx.events['Deposit']['investor'] == accounts[1]
     assert tx.events['Deposit']['amount'] == "6 ether"
 
-# открытие нового счета
+
+# с переполнением массива адресов и реинвестом
 def test_new_deposit_3(mlm):
-    mlm.newDeposit(accounts[9], {'from': accounts[2], 'value': "90 ether"})  # чтобы хватило на реинвест
-    info = mlm.getInvestorInfo(accounts[0])
+    mlm.newDeposit(accounts[9], {'from': accounts[8], 'value': "90 ether"})  # чтобы хватило на реинвест
+    mlm.newDeposit(accounts[9], {'from': accounts[7], 'value': "90 ether"})
+    mlm.newDeposit(accounts[9], {'from': accounts[3], 'value': "90 ether"})
+    info = mlm.getCertainDeposit(accounts[0], 0)
     profit = 7 * 10**16 * 7
-    assert info[2] == profit
+    assert info[1] == profit
 
     mlm.increaseNowTime(3, 17, {'from': accounts[0]})
-    assert mlm.checkDaysWithoutReward() == 3
+    assert mlm.checkDaysWithoutReward(0, {'from': accounts[0]}) == 3
+    assert mlm.checkDaysWithoutReward(1, {'from': accounts[0]}) == 0
 
-    # 7 % от 7 eth (прошлого депозита)
     mlm.newDeposit(accounts[1], {'from': accounts[0], 'value': "12 ether"})
-    info = mlm.getInvestorInfo(accounts[0])
+    print(mlm.getAllDeposits(accounts[0]))
 
-    profit += ((7+12) * 10 ** 16) * 1 * 7 + (7 * 10 ** 16) * 2 * 7
-    assert info[2] == profit
+    assert mlm.checkDaysWithoutReward(0, {'from': accounts[0]}) == 3
+    assert mlm.checkDaysWithoutReward(1, {'from': accounts[0]}) == 0
 
-    lastUpdate = info[3]
-    deadline = info[4]
+    info = mlm.getCertainDeposit(accounts[0], 1)
+
+    assert info[1] == 12 * 10**16 * 7
 
     mlm.increaseNowTime(37, 18, {'from': accounts[0]})
-    assert mlm.checkDaysWithoutReward() == 36
+    assert mlm.checkDaysWithoutReward(0, {'from': accounts[0]}) == 39
+    assert mlm.checkDaysWithoutReward(1, {'from': accounts[0]}) == 37
 
-    with brownie.reverts("Deposit and profit must be withdrawned first"):
-        mlm.newDeposit(accounts[1], {'from': accounts[0], 'value': "6 ether"})
-    assert mlm.checkDaysWithoutReward() == 36
+    for i in range(10):
+        mlm.newDeposit(accounts[2], {'from': accounts[6], 'value': "5 ether"})
+
+    info = mlm.getRefs({'from': accounts[6]})
+    assert info[0] == accounts[2]
+    assert info[1] != accounts[2] and info[1] != accounts[6]
+    assert info[2] != accounts[2]
+    
+    with brownie.reverts("All deposits should be withdrawned before new investment"):
+        mlm.newDeposit(accounts[2], {'from': accounts[6], 'value': "6 ether"})
+
+    mlm.increaseNowTime(40, 18, {'from': accounts[0]})
+    mlm.reinvestAll({'from': accounts[6]})
+    mlm.newDeposit(accounts[2], {'from': accounts[6], 'value': "6 ether"})
+
+    assert mlm.checkDaysWithoutReward(0, {'from': accounts[6]}) == 0
+    assert mlm.checkDaysWithoutReward(9, {'from': accounts[6]}) == 0
+    assert mlm.getCertainDeposit(accounts[6], 0)[0] == 6*10**18
+    assert mlm.getCertainDeposit(accounts[6], 1)[0] == 0
 
     before = accounts[0].balance()
 
-    deposit = (7 + 12) * 10 ** 18
-    print("Deposited: ", mlm.getInvestorInfo(accounts[0])[1])
-    print("Profit: ", mlm.getInvestorInfo(accounts[0])[2])
-   # print("Profit2: ", mlm.getInvestorInfo(accounts[0])[2] - profit)
+    info = mlm.getCertainDeposit(accounts[0], 0)
 
-    assert mlm.getInvestorInfo(accounts[0])[2] == profit
+    lastUpdate = info[2]
+    deadline = info[3]
+
     tx = mlm.reinvestAll({'from': accounts[0]})
-    profit += ((7 + 12) * 10 ** 16) * 36 * 7
 
-
-    info = mlm.getInvestorInfo(accounts[0])
+    info = mlm.getCertainDeposit(accounts[0], 0)
+    assert info[0] == 0
     assert info[1] == 0
-    assert info[2] == 0
 
-    assert mlm.getInvestorInfo(accounts[0])[3] == mlm.getInvestorInfo(accounts[0])[4]
-    assert mlm.getInvestorInfo(accounts[0])[3] == deadline
-    assert mlm.getInvestorInfo(accounts[0])[3] > lastUpdate
+    info = mlm.getCertainDeposit(accounts[0], 1)
+    assert info[0] == 0
+    assert info[1] == 0
 
-    assert tx.events['Reinvest']['amountWithdrawned'] == profit * 94 / 100
-    assert tx.events['Reinvest']['amountReinvested'] == 0
-    print(before + profit + deposit - accounts[0].balance())  # = 0
+    assert mlm.getCertainDeposit(accounts[0], 0)[3] == mlm.getCertainDeposit(accounts[0], 0)[2]
+    assert mlm.getCertainDeposit(accounts[0], 0)[3] == deadline
+    assert mlm.getCertainDeposit(accounts[0], 0)[2] != lastUpdate
 
-    mlm.newDeposit(accounts[1], {'from': accounts[0], 'value': "12 ether"})
-    info = mlm.getInvestorInfo(accounts[0])
+    profit = 7 * 10**14 * 7 * 40 * 94
+    profit2 = 12 * 10 ** 14 * 7 * 40 * 94
 
-    assert info[1] == "12 ether"
-    assert info[2] == 12 * 10**16 * 7
-    assert info[4] > deadline
-    assert info[3] != lastUpdate
-
+    assert tx.events['Reinvest'][0]['amountWithdrawned'] == profit
+    assert tx.events['Reinvest'][0]['amountReinvested'] == 0
+    assert tx.events['Reinvest'][1]['amountWithdrawned'] == profit2
+    assert tx.events['Reinvest'][1]['amountReinvested'] == 0
+    print(before + profit + profit2 + (12+7) * 10**18 - accounts[0].balance())  # = 0
 
 # все реферреры
 def test_referrers_1(mlm):
@@ -130,7 +152,7 @@ def test_referrers_1(mlm):
             assert events[2]['referrer'] == accounts[1]
             assert events[2]['amount'] == eth * 1
 
-    print(mlm.getInvestorInfo(accounts[8])[0])
+    print(mlm.getRefs({'from': accounts[8]}))
 
 
 # 3 реферрера
@@ -138,8 +160,8 @@ def test_referrers_2(mlm):
     for i in range(3):
         mlm.newDeposit(accounts[i + 1], {'from': accounts[i + 2], 'value': "5 ether"})
 
-    refs = mlm.getInvestorInfo(accounts[4])[0]
+    refs = mlm.getRefs({'from': accounts[4]})
     print(refs)
     assert refs[0] == accounts[3]
-    assert mlm.getInvestorInfo(accounts[3])[0][0] == accounts[2]
+    assert mlm.getRefs({'from': accounts[3]})[0] == accounts[2]
 
