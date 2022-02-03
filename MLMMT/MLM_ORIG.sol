@@ -1,7 +1,39 @@
 pragma solidity ^0.8.11;
 
 
-contract Mlm {
+abstract contract ReentrancyGuard {
+    uint256 private constant _NOT_ENTERED = 1;
+    uint256 private constant _ENTERED = 2;
+
+    uint256 private _status;
+
+    constructor() {
+        _status = _NOT_ENTERED;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and making it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        // On the first call to nonReentrant, _notEntered will be true
+        require(_status != _ENTERED, "ReentrancyGuard: reentrant call");
+
+        // Any calls to nonReentrant after this point will fail
+        _status = _ENTERED;
+
+        _;
+
+        // By storing the original value once again, a refund is triggered (see
+        // https://eips.ethereum.org/EIPS/eip-2200)
+        _status = _NOT_ENTERED;
+    }
+}
+
+contract Mlm is ReentrancyGuard{
     address payable public admin;
     uint256 constant DAILY_PROFIT_PERC = 7;
 
@@ -28,19 +60,26 @@ contract Mlm {
     event Reinvest(address indexed investor, uint256 amountWithdrawned, uint256 amountReinvested);
     event RefBonus(address indexed investor, address indexed referrer, uint256 amount);
 
-    struct Investor {
-        address[7] refs;
+    struct Investment {
         uint256 deposited;
         uint256 profit;               // доход, для реинвеста
         uint256 lastUpdate;           // обновление времени, для расчета наград
         uint256 deadline;             // последний день начисления %
     }
 
-    mapping(address => Investor) public investors;
+    mapping(address => Investment[10]) public invests;
+    mapping(address => address[7]) public refs;
 
-    modifier checkDate() {
-       require(investors[msg.sender].deadline != 0,
+    modifier checkDate(uint256 index) {
+       require(invests[msg.sender][index].deadline != 0,
                "newDeposit function must be called first"
+        );
+        _;
+    }
+
+    modifier checkIndex(uint256 index) {
+       require(index < 10,
+               "Unappropriate index"
         );
         _;
     }
@@ -55,103 +94,67 @@ contract Mlm {
         require(msg.sender != _ref,"The caller and ref address must be different");
 
         uint256 amount = msg.value;
-        if (investors[msg.sender].deadline == 0 || 
-            investors[msg.sender].deadline + 1 days <= block.timestamp) {
-            if (investors[msg.sender].deadline == 0 && _ref != address(0)) { //инициализация счета
-                investors[msg.sender].refs[0] = _ref;                  
-                sendRefBonus(payable(_ref), 0, amount);
-                addReferrers(msg.sender, _ref, amount);
+        uint256 ind = 11;
+        for (uint256 i = 0; i < 10; i++) {
+            if (invests[msg.sender][i].deadline == 0) {
+                ind = i;
+                break;
             }
-
-            if (investors[msg.sender].deadline + 1 days <= block.timestamp) {  // открытие нового счета
-                require(investors[msg.sender].deposited == 0 &&
-                    investors[msg.sender].profit == 0,
-                    "Deposit and profit must be withdrawned first"
-                );
-            }
-            uint256 time = block.timestamp;
-            investors[msg.sender].lastUpdate = time;
-            investors[msg.sender].deadline = time + (DEPOSIT_DAYS - 1) * 1 days;  // + 39 дней
-            investors[msg.sender].profit = (amount / 100) * DAILY_PROFIT_PERC;   // за первый день
-            investors[msg.sender].deposited = amount;
-        } else {
-            if (investors[msg.sender].deadline < block.timestamp)  // по истечении 40 дней можно забрать
-                revert("The deposit expires in a day");           // в этом случае остался последний день
-            // для ежедневного профита
-            if (checkDaysWithoutReward() > 1) {     // логика для обработки профита (от нового депозита) текущего дня и предыдущих
-                investors[msg.sender].lastUpdate += 1 days;
-                investors[msg.sender].profit += calculateReward();
-                investors[msg.sender].lastUpdate -= 1 days;
-            }
-            investors[msg.sender].deposited += amount;
-            investors[msg.sender].profit += calculateReward();
         }
+        
+        if (ind == 11) {      // тк ограничение на массив
+            if (!checkIfFundsWithrawned())
+                revert("All deposits should be withdrawned before new investment");
+            ind = 0;
+            delete invests[msg.sender];
+        }
+        
+        Investment storage invest = invests[msg.sender][ind];
+
+        if (_ref != address(0) && refs[msg.sender][0] == address(0)) { 
+            refs[msg.sender][0] = _ref;                  
+            sendRefBonus(payable(_ref), 0, amount);
+            addReferrers(msg.sender, _ref, amount);
+        }
+        uint256 time = block.timestamp;
+        invest.lastUpdate = time;
+        invest.deadline = time + (DEPOSIT_DAYS - 1) * 1 days;  // + 39 дней
+        invest.profit = (amount / 100) * DAILY_PROFIT_PERC;   // за первый день
+        invest.deposited = amount;
 
         emit Deposit(msg.sender, amount);
 
-        toAdmin(amount * DEPOSIT_FEE_PERC / 100);
+        sendTo(admin, amount * DEPOSIT_FEE_PERC / 100);
     }
 
-    function reinvestAll() external checkDate {
-        uint256 profit = investors[msg.sender].profit + calculateReward();
-
-        require(profit >= MIN_REINVEST, "Minimum withdraw is 0.05 Matic");
-
-        investors[msg.sender].profit = 0;
-        _reinvest(profit);
-
-        if (investors[msg.sender].deadline + 1 days <= block.timestamp &&
-            investors[msg.sender].deposited != 0)
-        {
-            returnDeposit();
+    function reinvestAll() external nonReentrant {        
+        for (uint256 i = 0; i < 10; i++) {
+            if(invests[msg.sender][i].deadline != 0) 
+                _reinvest(i);   
+            else 
+                break;
         }
     }
 
-    function reinvest(uint256 amount) external checkDate {
-        require(amount >= MIN_REINVEST, "Minimum withdraw is 0.05 Matic");
-
-        uint256 profit = investors[msg.sender].profit + calculateReward();
-
-        if (amount < profit) {
-            investors[msg.sender].profit -= amount;
-            _reinvest(amount);
-        } else {                    // amount >= profit => реинвестируем весь профит
-            investors[msg.sender].profit = 0;
-           _reinvest(profit);
-        }
-
-        if (investors[msg.sender].deadline + 1 days <= block.timestamp &&
-            investors[msg.sender].deposited != 0) 
-        {
-            returnDeposit();
-        }
+    function reinvest(uint256 index) external checkIndex(index) checkDate(index) nonReentrant {
+        _reinvest(index);
     }
 
-    function _reinvest(uint256 amount) private {
-        uint256 reinvested;
-        uint256 send;
-        if (investors[msg.sender].deadline >= block.timestamp) {   //deadline - время последнего начисления
-            reinvested = amount * REINVEST_OF_PROFIT_PERC / 100;
-            send =  amount * REINVEST_WITHDRAW_PERC / 100;
-            investors[msg.sender].deposited += reinvested;
-        } else {                        // когда счет закрылся
-            send =  (amount * (100 - REINVEST_FEE_PERC)) / 100;
-        }
-
-        (bool transferSuccess, ) = payable(msg.sender).call{value: send}("");
-        require(transferSuccess, "Transfer to investor failed");
-
-        emit Reinvest(msg.sender, send, reinvested);
-        toAdmin(amount * REINVEST_FEE_PERC / 100);
+     function getAllDeposits(address investor) public view returns(Investment[10] memory) {
+        return invests[investor];
     }
 
-    function getInvestorInfo(address investor) public view returns(Investor memory) {
-        return investors[investor];
+    function getCertainDeposit(address investor, uint256 index) public view checkIndex(index) returns(Investment memory)  {
+        return invests[investor][index];
     }
 
-    function checkDaysWithoutReward() public view returns(uint256) {
-        uint256 deadline = investors[msg.sender].deadline;
-        uint256 lastUpdate = investors[msg.sender].lastUpdate;
+    function getRefs() public view returns(address[7] memory) {
+        return refs[msg.sender];
+    }
+
+    function checkDaysWithoutReward(uint256 index) public view checkIndex(index) returns(uint256) {
+        uint256 deadline = invests[msg.sender][index].deadline;
+        uint256 lastUpdate = invests[msg.sender][index].lastUpdate;
         uint256 _days;
 
         if (deadline < block.timestamp) {
@@ -166,19 +169,60 @@ contract Mlm {
         return _days;
     }
 
-    function calculateReward() private returns(uint256) {   
-        uint256 amount = investors[msg.sender].deposited;
-        uint256 differenceDays = checkDaysWithoutReward();
-        investors[msg.sender].lastUpdate += differenceDays * 1 days;
+
+    function _reinvest(uint256 index) private {
+        Investment storage invest = invests[msg.sender][index];
+        uint256 amount = invest.profit + calculateReward(index);
+        invest.profit = 0;
+
+        require(amount >= MIN_REINVEST, "Minimum withdraw is 0.05 Matic");
+       
+        uint256 reinvested;
+        uint256 send;
+        if (invest.deadline >= block.timestamp) {   //deadline - время последнего начисления
+            reinvested = amount * REINVEST_OF_PROFIT_PERC / 100;
+            send =  amount * REINVEST_WITHDRAW_PERC / 100;
+            invest.deposited += reinvested;
+        } else {                        // когда счет закрылся
+            send =  (amount * (100 - REINVEST_FEE_PERC)) / 100;
+        }
+
+        sendTo(msg.sender, send);
+        emit Reinvest(msg.sender, send, reinvested);
+        
+        sendTo(admin, amount * REINVEST_FEE_PERC / 100);
+
+        if (invest.deadline + 1 days <= block.timestamp &&
+            invest.deposited != 0) 
+        {
+            returnDeposit(index);
+        }
+    }
+
+    function checkIfFundsWithrawned() private view returns(bool) {
+        Investment[10] storage invest = invests[msg.sender];
+        for (uint256 i = 0; i < 10; i++) {
+            if (invest[i].profit == 0 && invest[i].deposited == 0)
+                continue;
+            else
+                return false;
+        }
+        return true;
+    }
+
+    function calculateReward(uint256 index) private returns(uint256) {   
+        uint256 amount = invests[msg.sender][index].deposited;
+        uint256 differenceDays = checkDaysWithoutReward(index);
+        invests[msg.sender][index].lastUpdate += differenceDays * 1 days;
 
         return (amount / 100) * differenceDays * DAILY_PROFIT_PERC;
     }
 
     function addReferrers(address investor, address _ref, uint256 amount) private {
-        address[7] memory referrers = investors[_ref].refs;
+        address[7] memory referrers = refs[_ref];
         for (uint256 i = 0; i < 6; i++) {
             if (referrers[i] != address(0)) {
-                investors[investor].refs[i+1] = referrers[i];
+                refs[investor][i+1] = referrers[i];
                 sendRefBonus(payable(referrers[i]), i+1, amount);
             } else break;
         }
@@ -201,30 +245,24 @@ contract Mlm {
         else if (level == 6)
             bonus = REF_LEVEL_7 * amount / 1000;
 
-        (bool transferSuccess, ) = payable(to).call{
-                value: bonus
-            }("");
-        require(transferSuccess, "Transfer to referrer failed");
+        sendTo(to, bonus);
 
         emit RefBonus(msg.sender, to, bonus);
     }
 
-    function returnDeposit() private {      // конец 40-ка дневного депозита
-        uint256 deposit = investors[msg.sender].deposited;
-        investors[msg.sender].deposited = 0;
+    function returnDeposit(uint256 index) private {      // конец 40-ка дневного депозита
+        uint256 deposit = invests[msg.sender][index].deposited;
+        invests[msg.sender][index].deposited = 0;
         
-        (bool transferSuccess, ) = payable(msg.sender).call{
-                value: deposit
-            }("");
-        require(transferSuccess, "Transfer to investor failed");
+        sendTo(msg.sender, deposit);
 
         emit ReturnDeposit(msg.sender, deposit);
     }
 
-    function toAdmin(uint256 amount) private {
-        (bool transferSuccess, ) = admin.call{
+    function sendTo(address to, uint256 amount) private {
+        (bool transferSuccess, ) = payable(to).call{
                 value: amount
             }("");
-        require(transferSuccess, "Transfer to admin failed");
+        require(transferSuccess, "Transfer failed");
     }
 }
